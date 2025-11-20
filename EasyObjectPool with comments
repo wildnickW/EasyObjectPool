@@ -1,0 +1,830 @@
+--[[
+	made by nickglazer. (made with love and a lil keyboard slamming)
+
+	EasyObjectPool - Object Pooling Made Easy™ (was ts tuff??)
+	
+	---------- DOCUMENTATION ----------
+	
+	BASIC USAGE:
+		local pool = EasyObjectPool.new({
+			Template = part,
+			PreGen = 10,
+			PoolName = "MyPool"
+		})
+		
+		local obj = pool:Get()
+		pool:Return(obj)
+	
+	POOL OPERATIONS:
+		pool:Get()           -- Get an object from the pool
+		pool:Return(obj)     -- Return an object to the pool
+		pool:ReturnAll()     -- Return all active objects
+		pool:ClearPool()     -- Completely clears the pool
+		pool:Resize(newSize) -- Change inactive pool size
+		pool:Validate()      -- Scan for invalid/missing objects
+		pool:GetInfo()       -- Returns info about a pool
+		pool:WarmUp(batchSize, delay) -- Batch pre-generation (use for high pools so there is no lag on creation)
+	
+	POOL BEHAVIOR:
+		pool.LifeTime        -- Auto-return objects after N seconds
+		pool.DestroyFunction -- Called when objects are destroyed
+		pool.RecycleMode     -- "LIFO" (default) or "FIFO"
+		pool.Meta[obj]       -- Per-object metadata table
+	
+	POOL EVENTS:
+		pool.Events.OnGet       -- Fired when object is retrieved
+		pool.Events.OnReturn    -- Fired when object is returned
+		pool.Events.OnExpand    -- Fired when pool grows
+		pool.Events.OnShrink    -- Fired when pool shrinks
+		pool.Events.OnDestroy   -- Fired when object is destroyed
+		pool.Events.OnPoolEmpty -- Fired when pool runs out (wont error)
+	
+	POOL MANAGER:
+		EasyObjectPool.Manager.GetPool(name)     -- Gets a pool
+		EasyObjectPool.Manager.GetAllPools()     -- Gets all pools
+		EasyObjectPool.Manager.DestroyPool(name) -- Destroys a pool
+		EasyObjectPool.Manager.GetPoolCount()    -- Gets how many pools are made
+		EasyObjectPool.Manager.PoolExists(name)  -- Checks if a pool exists
+		EasyObjectPool.DestroyAllPools()         -- Destroys every pool
+	
+	CLUSTER SYSTEM:
+		EasyObjectPool.Manager.CreateCluster(name)             -- Creates a pool cluster
+		EasyObjectPool.Manager.SwitchCluster(name)             -- Switches the cluster selected
+		EasyObjectPool.Manager.AddPoolToCluster(clusterName, pool) -- Add a pool to a cluster
+		EasyObjectPool.Manager.DestroyCluster(name)            -- Destroys a cluster and all the pools inside.
+		EasyObjectPool.Manager.GetCluster(name)                -- Returns a cluster
+		EasyObjectPool.Manager.GetActiveCluster()              -- Get the cluster selected
+	
+	CONFIG OPTIONS:
+		Template (required)         -- Object to clone
+		PreGen (required, default 10) -- Initial size
+		MaxSize (optional)          -- Maximum pool size
+		AutoExpand (default true)   -- Create new objects when empty
+		AutoShrink (default false)  -- Shrink pool when under-used
+		ShrinkThreshold (default 0.3) -- Shrink when usage below this
+		PoolName (optional, default Pool_TotalPools + 1) -- Name of the pool
+		ResetFunction (optional)    -- Called when object is retrieved
+		OnGet (optional)            -- Callback for Get()
+		OnReturn (optional)         -- Callback for Return()
+		DestroyFunction (optional)  -- Called when object is destroyed
+		RecycleMode (optional, default LIFO) -- "LIFO" (default) or "FIFO" (LIFO = (Last In Table), FIFO = (First In Table))
+		LifeTime (optional)         -- Auto-return objects after N sec
+		AutoRebuild (optional, default false) -- Rebuild missing objects in Validate()
+		
+	----------------------------------
+--]]
+
+local RunService = game:GetService("RunService")
+
+local EasyObjectPool = {}
+EasyObjectPool.__index = EasyObjectPool
+
+-- this is where we keep track of all the pools we create
+local PoolManager = {
+	Pools = {}, -- stores all active pools by name
+	TotalPools = 0, -- keeps count of how many pools we've made
+	Clusters = {}, -- groups of pools for organization
+	ActiveCluster = nil -- which cluster we're currently working with
+}
+
+----- Type definitions -----
+-- config table for creating a new pool
+export type PoolConfig = {
+	Template: Instance, -- the object we'll be cloning
+	PreGen: number?, -- how many objects to make upfront
+	MaxSize: number?, -- cap on total objects (optional)
+	AutoExpand: boolean?, -- should we make more objects when we run out?
+	AutoShrink: boolean?, -- should we remove unused objects?
+	ShrinkThreshold: number?, -- how empty before we shrink
+	ResetFunction: ((Instance) -> ())?, -- function to reset objects when retrieved
+	OnGet: ((Instance) -> ())?, -- callback when getting an object
+	OnReturn: ((Instance) -> ())?, -- callback when returning an object
+	DestroyFunction: ((Instance) -> ())?, -- cleanup function for destroyed objects
+	PoolName: string?, -- name for this pool
+	RecycleMode: string?, -- LIFO or FIFO retrieval
+	LifeTime: number?, -- auto-return timer
+	AutoRebuild: boolean? -- should we rebuild missing objects?
+}
+
+-- the actual pool object with all its methods
+export type ObjectPool = {
+	Template: Instance, -- the template we clone from
+	Inactive: {Instance}, -- objects sitting in the pool
+	Active: {[Instance]: boolean}, -- objects currently in use
+	PreGen: number, -- initial pool size
+	MaxSize: number?, -- max objects allowed
+	AutoExpand: boolean, -- can we make more?
+	AutoShrink: boolean, -- do we clean up extras?
+	ShrinkThreshold: number, -- usage % before shrinking
+	ResetFunction: ((Instance) -> ())?, -- reset callback
+	OnGet: ((Instance) -> ())?, -- get callback
+	OnReturn: ((Instance) -> ())?, -- return callback
+	DestroyFunction: ((Instance) -> ())?, -- destroy callback
+	PoolName: string, -- this pool's name
+	PoolID: string, -- unique identifier
+	RecycleMode: string, -- retrieval order
+	LifeTime: number?, -- auto-return time
+	AutoRebuild: boolean, -- rebuild missing objects?
+	Meta: {[Instance]: any}, -- metadata for each object
+	Events: {[string]: BindableEvent}, -- event system
+
+	-- all the methods we can use
+	new: (config: PoolConfig) -> ObjectPool,
+	Get: (self: ObjectPool) -> Instance?,
+	Return: (self: ObjectPool, obj: Instance) -> boolean,
+	ReturnAll: (self: ObjectPool) -> number,
+	ClearPool: (self: ObjectPool) -> (),
+	Resize: (self: ObjectPool, newSize: number) -> (),
+	GetActiveCount: (self: ObjectPool) -> number,
+	GetInactiveCount: (self: ObjectPool) -> number,
+	IsFromPool: (self: ObjectPool, obj: Instance) -> boolean,
+	WarmUp: (self: ObjectPool, batchSize: number?, delay: number?) -> (),
+	Validate: (self: ObjectPool) -> {valid: number, invalid: number, rebuilt: number},
+	GetStats: (self: ObjectPool) -> {[string]: any}
+}
+
+-- manager functions for handling multiple pools
+export type PoolManagerType = {
+	GetPool: (name: string) -> ObjectPool?,
+	GetAllPools: () -> {[string]: ObjectPool},
+	DestroyPool: (name: string) -> boolean,
+	GetPoolCount: () -> number,
+	PoolExists: (name: string) -> boolean,
+	CreateCluster: (name: string) -> boolean,
+	SwitchCluster: (name: string) -> boolean,
+	AddPoolToCluster: (clusterName: string, pool: ObjectPool) -> boolean,
+	DestroyCluster: (name: string) -> boolean,
+	GetCluster: (name: string) -> {ObjectPool}?,
+	GetActiveCluster: () -> string?
+}
+-------------------------------
+
+-- this creates a brand new pool based on your config
+function EasyObjectPool.new(config: PoolConfig): ObjectPool
+	-- set up the metatable so we can use : syntax
+	local self = setmetatable({}, EasyObjectPool)
+
+	---- Config ----
+	-- store the object we're gonna clone
+	self.Template = config.Template
+	-- how many objects to make initially (default 10)
+	self.PreGen = config.PreGen or 10
+	-- optional max size cap
+	self.MaxSize = config.MaxSize
+	-- should we make more objects if we run out? (default true)
+	self.AutoExpand = if config.AutoExpand ~= nil then config.AutoExpand else true
+	-- should we remove extra objects when not in use? (default false)
+	self.AutoShrink = config.AutoShrink or false
+	-- what % usage triggers shrinking (default 30%)
+	self.ShrinkThreshold = config.ShrinkThreshold or 0.3
+	-- optional function to reset objects when retrieved
+	self.ResetFunction = config.ResetFunction
+	-- optional callback when getting objects
+	self.OnGet = config.OnGet
+	-- optional callback when returning objects
+	self.OnReturn = config.OnReturn
+	-- optional cleanup function for destroyed objects
+	self.DestroyFunction = config.DestroyFunction
+	-- name this pool, or auto-generate one
+	self.PoolName = config.PoolName or `Pool_{PoolManager.TotalPools + 1}`
+	-- LIFO (last in first out) or FIFO (first in first out)
+	self.RecycleMode = config.RecycleMode or "LIFO"
+	-- optional auto-return timer in seconds
+	self.LifeTime = config.LifeTime
+	-- should we auto-rebuild missing objects?
+	self.AutoRebuild = config.AutoRebuild or false
+	-----------------
+
+	---- Shrinking ----
+	-- track when we last shrunk the pool
+	self.LastShrinkTime = 0
+	-- minimum time between shrinks (prevents constant resizing)
+	self.ShrinkCooldown = 1
+	-------------------
+
+	---- Constants ----
+	-- unique ID combining name and creation time
+	self.PoolID = `{self.PoolName}_{os.clock()}`
+	-- array of objects ready to use
+	self.Inactive = {}
+	-- dictionary of objects currently being used
+	self.Active = {}
+	-- store custom data per object
+	self.Meta = {}
+	-------------------
+
+	---- Creation ----
+	-- remember when we made this pool
+	self.CreationTime = os.clock()
+	-------------------------
+
+	---- Lifetime ----
+	-- track auto-return threads for each object
+	self.LifetimeThreads = {}
+	--------------------------
+
+	---- Events ----
+	-- set up all the events we can listen to
+	self.Events = {
+		OnGet = Instance.new("BindableEvent"), -- fires when object is retrieved
+		OnReturn = Instance.new("BindableEvent"), -- fires when object is returned
+		OnExpand = Instance.new("BindableEvent"), -- fires when pool grows
+		OnShrink = Instance.new("BindableEvent"), -- fires when pool shrinks
+		OnDestroy = Instance.new("BindableEvent"), -- fires when object is destroyed
+		OnPoolEmpty = Instance.new("BindableEvent") -- fires when pool runs dry
+	}
+	-----------------
+
+	---- Checks ----
+	-- make sure max size isn't smaller than initial size (that'd be weird)
+	if self.MaxSize and self.MaxSize < self.PreGen then
+		warn(`[EasyObjectPool] Pool '{self.PoolName}': Max size ({self.MaxSize}) is less than the pool size ({self.PreGen}), adjusting the max size to the pool size ({self.PreGen}).`)
+		self.MaxSize = self.PreGen
+	end
+
+	-- validate recycle mode is either LIFO or FIFO
+	if self.RecycleMode ~= "LIFO" and self.RecycleMode ~= "FIFO" then
+		warn(`[EasyObjectPool] Pool '{self.PoolName}': Invalid RecycleMode '{self.RecycleMode}', defaulting to LIFO.`)
+		self.RecycleMode = "LIFO"
+	end
+	----------------
+
+	-- create all the initial objects and stash them in the inactive pool
+	for _ = 1, self.PreGen do
+		local obj = self.Template:Clone() -- make a copy
+		obj.Parent = nil -- keep it stored, not in workspace yet
+		table.insert(self.Inactive, obj) -- add to our pool
+	end
+
+	-- register this pool with the manager
+	PoolManager.Pools[self.PoolName] = self
+	PoolManager.TotalPools += 1
+
+	-- if we have an active cluster, add this pool to it
+	if PoolManager.ActiveCluster then
+		PoolManager.AddPoolToCluster(PoolManager.ActiveCluster, self)
+	end
+
+	-- let em know we're ready to go
+	warn(`[EasyObjectPool] Pool '{self.PoolName}' created with {self.PreGen} objects.`)
+	return self
+end
+
+-- this is how you get an object from the pool
+function EasyObjectPool:Get(): Instance?
+	local obj: Instance
+
+	-- check if we have any objects sitting around
+	if #self.Inactive > 0 then
+		-- FIFO means grab the oldest one (first in line)
+		if self.RecycleMode == "FIFO" then
+			obj = table.remove(self.Inactive, 1)
+		else
+			-- LIFO means grab the newest one (last in line)
+			obj = table.remove(self.Inactive)
+		end
+	elseif self.AutoExpand then
+		-- no objects left, but we can make more
+		local activeCount = self:GetActiveCount()
+		-- make sure we haven't hit the max size limit
+		if not self.MaxSize or activeCount < self.MaxSize then
+			obj = self.Template:Clone() -- create a fresh one
+			self.Events.OnExpand:Fire(obj) -- fire the expand event
+		else
+			-- we're at max capacity, can't make more
+			warn(`[EasyObjectPool] Pool '{self.PoolName}' exhausted, consider increasing the max size or returning more objects.`)
+			self.Events.OnPoolEmpty:Fire() -- let listeners know we're empty
+			return nil
+		end
+	else
+		-- no auto-expand and we're out of objects
+		warn(`[EasyObjectPool] Pool '{self.PoolName}' exhausted, consider increasing the max size or returning more objects.`)
+		self.Events.OnPoolEmpty:Fire()
+		return nil
+	end
+
+	-- run the reset function if we have one (clean up the object)
+	if self.ResetFunction then
+		self.ResetFunction(obj)
+	end
+
+	-- mark this object as active
+	self.Active[obj] = true
+
+	-- set up metadata for this object if it doesn't exist
+	if not self.Meta[obj] then
+		self.Meta[obj] = {}
+	end
+
+	-- run the get callback if we have one
+	if self.OnGet then
+		self.OnGet(obj)
+	end
+
+	-- fire the get event
+	self.Events.OnGet:Fire(obj)
+	-- put it in the workspace so it's visible/active
+	obj.Parent = workspace
+
+	-- if we have a lifetime set, schedule auto-return
+	if self.LifeTime then
+		self:ScheduleAutoReturn(obj, self.LifeTime)
+	end
+
+	return obj
+end
+
+-- sets up a timer to automatically return an object after a certain time
+function EasyObjectPool:ScheduleAutoReturn(obj: Instance, lifetime: number)
+	-- cancel any existing timer for this object
+	self:CancelLifetime(obj)
+
+	-- spawn a new thread that waits then returns the object
+	local thread = task.spawn(function()
+		task.wait(lifetime) -- wait for the specified time
+		-- make sure it's still active (could've been returned manually)
+		if self.Active[obj] then
+			self:Return(obj) -- return it automatically
+		end
+		self.LifetimeThreads[obj] = nil -- clean up the thread reference
+	end)
+
+	-- store the thread so we can cancel it later if needed
+	self.LifetimeThreads[obj] = thread
+end
+
+-- stops an object from auto-returning
+function EasyObjectPool:CancelLifetime(obj: Instance)
+	local thread = self.LifetimeThreads[obj]
+	if thread then
+		-- try to cancel the thread (wrapped in pcall just in case)
+		pcall(function()
+			task.cancel(thread)
+		end)
+		self.LifetimeThreads[obj] = nil -- clean up
+	end
+end
+
+-- put an object back in the pool when you're done with it
+function EasyObjectPool:Return(obj: Instance): boolean
+	-- make sure this object actually belongs to this pool
+	if not self.Active[obj] then
+		warn(`[EasyObjectPool] Pool '{self.PoolName}' attempted to return an object that was not from this pool.`)
+		return false
+	end
+
+	-- cancel the auto-return timer if it exists
+	self:CancelLifetime(obj)
+	-- remove from workspace
+	obj.Parent = nil
+	-- mark as inactive
+	self.Active[obj] = nil
+	-- put back in the pool
+	table.insert(self.Inactive, obj)
+
+	-- run the return callback if we have one
+	if self.OnReturn then
+		self.OnReturn(obj)
+	end
+
+	-- fire the return event
+	self.Events.OnReturn:Fire(obj)
+
+	-- check if we should shrink the pool
+	if self.AutoShrink then
+		local now = os.clock()
+		-- only shrink if enough time has passed (cooldown)
+		if now - self.LastShrinkTime >= self.ShrinkCooldown then
+			local activeCount = self:GetActiveCount()
+			local totalCount = activeCount + #self.Inactive
+
+			-- if we have more than the initial size and usage is low
+			if totalCount > self.PreGen and (activeCount / totalCount) < self.ShrinkThreshold then
+				-- figure out how many to remove
+				local excessCount = totalCount - self.PreGen
+
+				-- remove the excess objects
+				for i = 1, math.min(excessCount, #self.Inactive) do
+					local excess = table.remove(self.Inactive)
+					if excess then
+						self:DestroyObject(excess) -- fully destroy it
+						self.Events.OnShrink:Fire(excess) -- fire shrink event
+					end
+				end
+			end
+
+			-- update the last shrink time
+			self.LastShrinkTime = now
+		end
+	end
+
+	return true
+end
+
+-- completely destroys an object and cleans up all its data
+function EasyObjectPool:DestroyObject(obj: Instance)
+	-- run custom destroy function if we have one
+	if self.DestroyFunction then
+		self.DestroyFunction(obj)
+	end
+
+	-- fire destroy event
+	self.Events.OnDestroy:Fire(obj)
+	-- remove metadata
+	self.Meta[obj] = nil
+	-- cancel any auto-return timers
+	self:CancelLifetime(obj)
+	-- actually destroy the instance
+	obj:Destroy()
+end
+
+-- returns every active object back to the pool in one go
+function EasyObjectPool:ReturnAll(): number
+	local count = 0
+
+	-- loop through all active objects
+	for obj, _ in self.Active do
+		-- remove from workspace if it's still there
+		if obj and obj.Parent then
+			obj.Parent = nil
+		end
+
+		-- cancel auto-return timer
+		self:CancelLifetime(obj)
+
+		-- run return callback
+		if self.OnReturn then
+			self.OnReturn(obj)
+		end
+
+		-- fire return event
+		self.Events.OnReturn:Fire(obj)
+		-- add back to inactive pool
+		table.insert(self.Inactive, obj)
+		count += 1
+	end
+
+	-- clear the active table
+	table.clear(self.Active)
+	warn(`[EasyObjectPool] Pool '{self.PoolName}' returned {count} objects.`)
+	return count
+end
+
+-- nukes the entire pool and everything in it
+function EasyObjectPool:ClearPool()
+	-- destroy all inactive objects
+	for _, obj in self.Inactive do
+		self:DestroyObject(obj)
+	end
+
+	-- destroy all active objects
+	for obj in self.Active do
+		if obj.Parent then
+			obj.Parent = nil -- remove from workspace first
+		end
+		self:DestroyObject(obj)
+	end
+
+	-- clear all the tables
+	table.clear(self.Inactive)
+	table.clear(self.Active)
+	table.clear(self.Meta)
+	table.clear(self.LifetimeThreads)
+
+	-- destroy the template
+	if self.Template then
+		self.Template:Destroy()
+		self.Template = nil
+	end
+
+	-- clear all callbacks
+	self.ResetFunction = nil
+	self.OnGet = nil
+	self.OnReturn = nil
+	self.DestroyFunction = nil
+
+	-- destroy all events
+	for _, event in self.Events do
+		event:Destroy()
+	end
+
+	-- clear events table
+	table.clear(self.Events)
+	warn(`[EasyObjectPool] Pool '{self.PoolName}' cleared.`)
+
+	-- remove from manager
+	PoolManager.Pools[self.PoolName] = nil
+	-- remove metatable
+	setmetatable(self, nil)
+	-- clear the whole object
+	table.clear(self)
+end
+
+-- changes how many inactive objects are in the pool
+function EasyObjectPool:Resize(newSize: number)
+	local currentInactive = #self.Inactive
+
+	-- need to make more objects
+	if newSize > currentInactive then
+		-- create the difference
+		for _ = 1, newSize - currentInactive do
+			local obj = self.Template:Clone()
+			obj.Parent = nil
+			table.insert(self.Inactive, obj)
+		end
+
+		warn(`[EasyObjectPool] Pool '{self.PoolName}' expanded by {newSize - currentInactive} objects.`)
+		self.Events.OnExpand:Fire(newSize - currentInactive)
+
+		-- need to remove objects
+	elseif newSize < currentInactive then
+		local shrinkCount = currentInactive - newSize
+
+		-- remove and destroy excess objects
+		for _ = 1, shrinkCount do
+			local obj = table.remove(self.Inactive)
+			if obj then
+				self:DestroyObject(obj)
+			end
+		end
+
+		warn(`[EasyObjectPool] Pool '{self.PoolName}' shrunk by {shrinkCount} objects.`)
+		self.Events.OnShrink:Fire(shrinkCount)
+	else
+		-- size is the same, nothing to do
+		warn(`[EasyObjectPool] Pool '{self.PoolName}' could not be shrunk or expanded as it is the same size as you provided.`)
+	end
+end
+
+-- creates objects gradually in batches to prevent lag spikes
+function EasyObjectPool:WarmUp(batchSize: number?, delay: number?)
+	-- default batch size of 10 objects at a time
+	batchSize = batchSize or 10
+	-- default 0.1 second delay between batches
+	delay = delay or 0.1
+	local targetSize = self.PreGen
+	local currentSize = #self.Inactive
+
+	-- already at target size, nothing to do
+	if currentSize >= targetSize then
+		warn(`[EasyObjectPool] Pool '{self.PoolName}' is already warmed up.`)
+		return
+	end
+
+	-- figure out how many more we need
+	local remaining = targetSize - currentSize
+	warn(`[EasyObjectPool] Pool '{self.PoolName}' warming up: generating {remaining} objects in batches of {batchSize}...`)
+
+	-- spawn a separate thread so we don't block
+	task.spawn(function()
+		-- keep creating until we hit target
+		while remaining > 0 do
+			-- create this batch (either full batch size or whatever's left)
+			local batchCount = math.min(batchSize, remaining)
+
+			for _ = 1, batchCount do
+				local obj = self.Template:Clone()
+				obj.Parent = nil
+				table.insert(self.Inactive, obj)
+			end
+
+			-- update remaining count
+			remaining -= batchCount
+
+			-- wait a bit before next batch (if there is one)
+			if remaining > 0 then
+				task.wait(delay)
+			end
+		end
+
+		warn(`[EasyObjectPool] Pool '{self.PoolName}' warm-up complete.`)
+	end)
+end
+
+-- scans the pool for missing or corrupted objects
+function EasyObjectPool:Validate(): {valid: number, invalid: number, rebuilt: number}
+	local valid = 0
+	local invalid = 0
+	local rebuilt = 0
+
+	local i = 1
+	-- check all inactive objects
+	while i <= #self.Inactive do
+		local obj = self.Inactive[i]
+
+		-- object is missing or has a parent (shouldn't have one)
+		if not obj or obj.Parent ~= nil then
+			table.remove(self.Inactive, i) -- remove it
+			invalid += 1
+
+			-- rebuild if we're supposed to
+			if self.AutoRebuild then
+				local newObj = self.Template:Clone()
+				newObj.Parent = nil
+				table.insert(self.Inactive, newObj)
+				rebuilt += 1
+			end
+		else
+			-- object is fine
+			valid += 1
+			i += 1
+		end
+	end
+
+	-- check all active objects
+	for obj in self.Active do
+		-- object is missing or doesn't have a parent (should have one)
+		if not obj or obj.Parent == nil then
+			self.Active[obj] = nil -- remove from active
+			invalid += 1
+
+			-- rebuild if we're supposed to
+			if self.AutoRebuild then
+				local newObj = self.Template:Clone()
+				newObj.Parent = nil
+				table.insert(self.Inactive, newObj)
+				rebuilt += 1
+			end
+		else
+			-- object is fine
+			valid += 1
+		end
+	end
+
+	-- package up the results
+	local result = {
+		valid = valid,
+		invalid = invalid,
+		rebuilt = rebuilt
+	}
+
+	-- warn if we found issues
+	if invalid > 0 then
+		warn(`[EasyObjectPool] Pool '{self.PoolName}' validation: {valid} valid, {invalid} invalid, {rebuilt} rebuilt.`)
+	end
+
+	return result
+end
+
+-- returns a table with all the pool's current info
+function EasyObjectPool:GetInfo(): {[string]: any}
+	return {
+		PoolName = self.PoolName, -- pool name
+		ActiveCount = self:GetActiveCount(), -- how many are in use
+		InactiveCount = self:GetInactiveCount(), -- how many are sitting in pool
+		TotalCount = self:GetActiveCount() + self:GetInactiveCount(), -- total objects
+		PreGen = self.PreGen, -- initial size
+		MaxSize = self.MaxSize, -- max size (if set)
+		RecycleMode = self.RecycleMode, -- LIFO or FIFO
+		LifeTime = self.LifeTime, -- auto-return time (if set)
+		CreationTime = self.CreationTime, -- when pool was created
+		Uptime = os.clock() - self.CreationTime, -- how long pool has existed
+		AutoExpand = self.AutoExpand, -- can it grow?
+		AutoShrink = self.AutoShrink -- can it shrink?
+	}
+end
+
+-- counts how many objects are currently being used
+function EasyObjectPool:GetActiveCount(): number
+	local count = 0
+	-- loop through active dictionary
+	for _ in self.Active do
+		count += 1
+	end
+	return count
+end
+
+-- counts how many objects are sitting in the pool
+function EasyObjectPool:GetInactiveCount(): number
+	return #self.Inactive
+end
+
+-- checks if a specific object came from this pool
+function EasyObjectPool:IsFromPool(obj: Instance): boolean
+	-- check if it's in active or inactive
+	return self.Active[obj] ~= nil or table.find(self.Inactive, obj) ~= nil
+end
+
+-- destroys every single pool that's been created
+function EasyObjectPool.DestroyAllPools()
+	-- loop through all pools
+	for name, pool in PoolManager.Pools do
+		pool:ClearPool() -- clear each one
+	end
+	warn(`[EasyObjectPool] All pools destroyed.`)
+end
+
+-- finds a pool by name
+function PoolManager.GetPool(name: string): ObjectPool?
+	return PoolManager.Pools[name]
+end
+
+-- returns a table of all pools
+function PoolManager.GetAllPools(): {[string]: ObjectPool}
+	return PoolManager.Pools
+end
+
+-- destroys a specific pool by name
+function PoolManager.DestroyPool(name: string): boolean
+	local pool = PoolManager.Pools[name]
+	if pool then
+		pool:ClearPool() -- clear it
+		return true
+	end
+	return false -- didn't exist
+end
+
+-- returns how many pools we have total
+function PoolManager.GetPoolCount(): number
+	return #PoolManager.Pools
+end
+
+-- checks if a pool with this name exists
+function PoolManager.PoolExists(name: string): boolean
+	return PoolManager.Pools[name] ~= nil
+end
+
+-- creates a cluster (group of pools)
+function PoolManager.CreateCluster(name: string): boolean
+	-- cluster already exists
+	if PoolManager.Clusters[name] then
+		warn(`[EasyObjectPool] Cluster '{name}' already exists.`)
+		return false
+	end
+
+	-- create empty cluster
+	PoolManager.Clusters[name] = {}
+	warn(`[EasyObjectPool] Cluster '{name}' created.`)
+	return true
+end
+
+-- switches which cluster is currently active
+function PoolManager.SwitchCluster(name: string): boolean
+	-- cluster doesn't exist
+	if not PoolManager.Clusters[name] then
+		warn(`[EasyObjectPool] Cluster '{name}' does not exist.`)
+		return false
+	end
+
+	-- switch to it
+	PoolManager.ActiveCluster = name
+	warn(`[EasyObjectPool] Switched to cluster '{name}'.`)
+	return true
+end
+
+-- adds a pool to a specific cluster
+function PoolManager.AddPoolToCluster(clusterName: string, pool: ObjectPool): boolean
+	-- cluster doesn't exist
+	if not PoolManager.Clusters[clusterName] then
+		warn(`[EasyObjectPool] Cluster '{clusterName}' does not exist.`)
+		return false
+	end
+
+	-- add pool to cluster
+	table.insert(PoolManager.Clusters[clusterName], pool)
+	return true
+end
+
+-- destroys a cluster and all pools inside it
+function PoolManager.DestroyCluster(name: string): boolean
+	-- cluster doesn't exist
+	if not PoolManager.Clusters[name] then
+		warn(`[EasyObjectPool] Cluster '{name}' does not exist.`)
+		return false
+	end
+
+	local cluster = PoolManager.Clusters[name]
+
+	-- destroy every pool in the cluster
+	for _, pool in cluster do
+		if pool and pool.ClearPool then
+			pool:ClearPool()
+		end
+	end
+
+	-- remove the cluster
+	PoolManager.Clusters[name] = nil
+
+	-- if this was the active cluster, clear that too
+	if PoolManager.ActiveCluster == name then
+		PoolManager.ActiveCluster = nil
+	end
+
+	warn(`[EasyObjectPool] Cluster '{name}' destroyed.`)
+	return true
+end
+
+-- gets a cluster by name
+function PoolManager.GetCluster(name: string): {ObjectPool}?
+	return PoolManager.Clusters[name]
+end
+
+-- returns the name of the currently active cluster
+function PoolManager.GetActiveCluster(): string?
+	return PoolManager.ActiveCluster
+end
+
+-- attach the manager to the main module so people can access it
+EasyObjectPool.Manager = PoolManager
+
+return EasyObjectPool
